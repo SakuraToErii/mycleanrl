@@ -91,7 +91,9 @@ def make_env(env_id, idx, capture_video, run_name, gamma):
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
             env = gym.make(env_id)
-        env = gym.wrappers.FlattenObservation(env)  # deal with dm_control's Dict observation space
+        env = gym.wrappers.FlattenObservation(
+            env
+        )  # deal with dm_control's Dict observation space
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env = gym.wrappers.ClipAction(env)
         env = gym.wrappers.NormalizeObservation(env)
@@ -113,32 +115,59 @@ class Agent(nn.Module):
     def __init__(self, envs):
         super().__init__()
         self.critic = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
+            layer_init(
+                nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)
+            ),
             nn.Tanh(),
             layer_init(nn.Linear(64, 64)),
             nn.Tanh(),
             layer_init(nn.Linear(64, 1), std=1.0),
         )
         self.actor_mean = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
+            layer_init(
+                nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)
+            ),
             nn.Tanh(),
             layer_init(nn.Linear(64, 64)),
             nn.Tanh(),
-            layer_init(nn.Linear(64, np.prod(envs.single_action_space.shape)), std=0.01),
+            # 连续动作用 .shape，离散动作用 .n
+            # 这里 np.prod() 是计算神经元要输出的动作空间的维度，比如动作空间是(3, 4)，代表机械臂编号和关节编号，那么网络就要输出一共12个关节的连续值
+            layer_init(
+                nn.Linear(64, np.prod(envs.single_action_space.shape)), std=0.01
+            ),
         )
-        self.actor_logstd = nn.Parameter(torch.zeros(1, np.prod(envs.single_action_space.shape)))
+
+        # 创建动作标准差的可学习参数
+        # 1 是批次维度，会在使用时进行广播
+        # 用对数标准差是为了保证标准差为正数
+        self.actor_logstd = nn.Parameter(
+            torch.zeros(1, np.prod(envs.single_action_space.shape))
+        )
 
     def get_value(self, x):
         return self.critic(x)
 
     def get_action_and_value(self, x, action=None):
         action_mean = self.actor_mean(x)
+
+        # expand_as 扩展形状，调用此方法时，action_mean 维度为 (batch_size, action_dim)
         action_logstd = self.actor_logstd.expand_as(action_mean)
         action_std = torch.exp(action_logstd)
         probs = Normal(action_mean, action_std)
         if action is None:
             action = probs.sample()
-        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.critic(x)
+
+        # 对于每个样本：
+        # total_log_prob[i] = log P(a₁) + log P(a₂) + ... + log P(a₆)
+        #                   = log[P(a₁) × P(a₂) × ... × P(a₆)]  # 独立性假设
+        #                   = log P(action_vector)
+        # 熵值同理
+        return (
+            action,
+            probs.log_prob(action).sum(1),
+            probs.entropy().sum(1),
+            self.critic(x),
+        )
 
 
 if __name__ == "__main__":
@@ -162,7 +191,8 @@ if __name__ == "__main__":
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
         "hyperparameters",
-        "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+        "|param|value|\n|-|-|\n%s"
+        % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
     # TRY NOT TO MODIFY: seeding
@@ -175,16 +205,26 @@ if __name__ == "__main__":
 
     # env setup
     envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, i, args.capture_video, run_name, args.gamma) for i in range(args.num_envs)]
+        [
+            make_env(args.env_id, i, args.capture_video, run_name, args.gamma)
+            for i in range(args.num_envs)
+        ]
     )
-    assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
+    assert isinstance(envs.single_action_space, gym.spaces.Box), (
+        "only continuous action space is supported"
+    )
 
     agent = Agent(envs).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
     # ALGO Logic: Storage setup
-    obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
-    actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
+    # 这里的 + 号不是数学上的加法，而是将两个元组（tuple）连接起来，创建一个新的、更长的元组，(num_steps, num_envs, observation_shape)
+    obs = torch.zeros(
+        (args.num_steps, args.num_envs) + envs.single_observation_space.shape
+    ).to(device)
+    actions = torch.zeros(
+        (args.num_steps, args.num_envs) + envs.single_action_space.shape
+    ).to(device)
     logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
     rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
@@ -204,6 +244,7 @@ if __name__ == "__main__":
             lrnow = frac * args.learning_rate
             optimizer.param_groups[0]["lr"] = lrnow
 
+        # 每次策略更新要求在环境中运行的步数
         for step in range(0, args.num_steps):
             global_step += args.num_envs
             obs[step] = next_obs
@@ -217,23 +258,36 @@ if __name__ == "__main__":
             logprobs[step] = logprob
 
             # TRY NOT TO MODIFY: execute the game and log data.
-            next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
+            next_obs, reward, terminations, truncations, infos = envs.step(
+                action.cpu().numpy()
+            )
             next_done = np.logical_or(terminations, truncations)
             rewards[step] = torch.tensor(reward).to(device).view(-1)
-            next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
+            next_obs, next_done = (
+                torch.Tensor(next_obs).to(device),
+                torch.Tensor(next_done).to(device),
+            )
 
             if "final_info" in infos:
                 for info in infos["final_info"]:
                     if info and "episode" in info:
-                        print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-                        writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                        writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
+                        print(
+                            f"global_step={global_step}, episodic_return={info['episode']['r']}"
+                        )
+                        writer.add_scalar(
+                            "charts/episodic_return", info["episode"]["r"], global_step
+                        )
+                        writer.add_scalar(
+                            "charts/episodic_length", info["episode"]["l"], global_step
+                        )
 
         # bootstrap value if not done
         with torch.no_grad():
             next_value = agent.get_value(next_obs).reshape(1, -1)
             advantages = torch.zeros_like(rewards).to(device)
             lastgaelam = 0
+
+            # 反向
             for t in reversed(range(args.num_steps)):
                 if t == args.num_steps - 1:
                     nextnonterminal = 1.0 - next_done
@@ -241,13 +295,24 @@ if __name__ == "__main__":
                 else:
                     nextnonterminal = 1.0 - dones[t + 1]
                     nextvalues = values[t + 1]
-                delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
-                advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
+                delta = (
+                    rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
+                )  # Q 值估计
+
+                # lastgaelam（GAE） 是所有 TD-Error 的指数加权移动平均
+                # A_t = δ_t ​+ γ*λ*(1−d_t+1​)A_t+1
+                # lamda 是一个超参数，控制 GAE 的平滑程度
+                # 当 lamda=1 时，GAE 退化为 TD(λ)；当 lamda=0 时，GAE 退化为 TD(0)
+                advantages[t] = lastgaelam = (
+                    delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
+                )
             returns = advantages + values
 
         # flatten the batch
+        #! obs本来的形状：(num_steps, num_envs, observation_shape)，展平后，
+        #! (num_steps * num_envs, observation_shape)，即 (batch_size, observation_shape)
         b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
-        b_logprobs = logprobs.reshape(-1)
+        b_logprobs = logprobs.reshape(-1)  # 将 (128, 4) 变成 (512,)
         b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
@@ -257,33 +322,52 @@ if __name__ == "__main__":
         b_inds = np.arange(args.batch_size)
         clipfracs = []
         for epoch in range(args.update_epochs):
-            np.random.shuffle(b_inds)
+            np.random.shuffle(b_inds)  # 打乱索引
+
+            # args.batch_size = int(args.num_envs * args.num_steps)
+            # args.minibatch_size = int(args.batch_size // args.num_minibatches=4)
             for start in range(0, args.batch_size, args.minibatch_size):
                 end = start + args.minibatch_size
+
+                # 这里的 start:end 是切片操作，表示从 b_inds 中取出一段连续的索引，大小为 args.minibatch_size
                 mb_inds = b_inds[start:end]
 
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
+                _, newlogprob, entropy, newvalue = agent.get_action_and_value(
+                    b_obs[mb_inds], b_actions[mb_inds]
+                )
                 logratio = newlogprob - b_logprobs[mb_inds]
-                ratio = logratio.exp()
+                ratio = logratio.exp()  #! 计算重要性采样比率
+                if epoch == 0 and start == 0:  #! 第一轮第一个minibatch
+                    print(f"First ratio: {ratio.mean().item():.6f}")  #! =1.0
+                    print(f"First logratio: {logratio.mean().item():.6f}")  #! =0.0
 
                 with torch.no_grad():
                     # calculate approx_kl http://joschu.net/blog/kl-approx.html
-                    old_approx_kl = (-logratio).mean()
-                    approx_kl = ((ratio - 1) - logratio).mean()
-                    clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
+                    old_approx_kl = (-logratio).mean()  #! 第一轮更新时，=0.0
+                    approx_kl = ((ratio - 1) - logratio).mean()  #! 第一轮更新时，=0.0
+                    clipfracs += [
+                        ((ratio - 1.0).abs() > args.clip_coef).float().mean().item()
+                    ]  # 计算裁剪比例，（ratio, 1-\clip_coef, 1+\clip_coef）
 
                 mb_advantages = b_advantages[mb_inds]
-                if args.norm_adv:
-                    mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
+                if args.norm_adv:  #! 优势函数归一化，发生在小批量级别
+                    mb_advantages = (mb_advantages - mb_advantages.mean()) / (
+                        mb_advantages.std() + 1e-8
+                    )
 
                 # Policy loss
-                pg_loss1 = -mb_advantages * ratio
-                pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
+                pg_loss1 = -mb_advantages * ratio  #! -1 * ρ * A
+                pg_loss2 = -mb_advantages * torch.clamp(
+                    ratio, 1 - args.clip_coef, 1 + args.clip_coef
+                )  #! -1 * clip(ρ, 1 - clip_coef, 1 + clip_coef) * A
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+                # min[ρ * A, clip(ρ, 1 - clip_coef, 1 + clip_coef) * A]，即损失函数
 
                 # Value loss
+                # newvalue 是当前策略下的状态值估计
+                # b_returns 是目标值，是滑动平均 A + Value
                 newvalue = newvalue.view(-1)
-                if args.clip_vloss:
+                if args.clip_vloss:  #! 值函数梯度裁剪，只是为了还原，实际会损害性能
                     v_loss_unclipped = (newvalue - b_returns[mb_inds]) ** 2
                     v_clipped = b_values[mb_inds] + torch.clamp(
                         newvalue - b_values[mb_inds],
@@ -297,22 +381,35 @@ if __name__ == "__main__":
                     v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
 
                 entropy_loss = entropy.mean()
-                loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
+                loss = (
+                    pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
+                )  # 总体损失和熵奖励
 
                 optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+                nn.utils.clip_grad_norm_(
+                    agent.parameters(), args.max_grad_norm
+                )  # 全局梯度裁剪
                 optimizer.step()
 
+            #! 早停机制，当新旧策略之间的KL散度超过设定阈值时，立即停止当前iteration的策略更新。使得策略迭代更加稳定，默认不开启
             if args.target_kl is not None and approx_kl > args.target_kl:
                 break
 
         y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
         var_y = np.var(y_true)
+
+        # 计算解释方差
+        # explained_var = 1.0：完美预测，价值网络完全准确
+        # explained_var = 0.0：预测效果等同于预测均值
+        # explained_var < 0.0：预测比预测均值还差
+        # explained_var → 1.0：价值网络学习得很好
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
-        writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
+        writer.add_scalar(
+            "charts/learning_rate", optimizer.param_groups[0]["lr"], global_step
+        )
         writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
         writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
         writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
@@ -321,7 +418,9 @@ if __name__ == "__main__":
         writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
         print("SPS:", int(global_step / (time.time() - start_time)))
-        writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+        writer.add_scalar(
+            "charts/SPS", int(global_step / (time.time() - start_time)), global_step
+        )
 
     if args.save_model:
         model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
@@ -347,7 +446,14 @@ if __name__ == "__main__":
 
             repo_name = f"{args.env_id}-{args.exp_name}-seed{args.seed}"
             repo_id = f"{args.hf_entity}/{repo_name}" if args.hf_entity else repo_name
-            push_to_hub(args, episodic_returns, repo_id, "PPO", f"runs/{run_name}", f"videos/{run_name}-eval")
+            push_to_hub(
+                args,
+                episodic_returns,
+                repo_id,
+                "PPO",
+                f"runs/{run_name}",
+                f"videos/{run_name}-eval",
+            )
 
     envs.close()
     writer.close()
